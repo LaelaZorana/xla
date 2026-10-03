@@ -15,16 +15,20 @@ limitations under the License.
 
 #include "xla/pjrt/se/se_raw_buffer.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "absl/functional/any_invocable.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "tsl/platform/casts.h"
 #include "tsl/profiler/lib/traceme.h"
 #include "xla/pjrt/async_work_runner.h"
@@ -40,7 +44,9 @@ limitations under the License.
 #include "xla/pjrt/se/pjrt_stream_executor_client.h"
 #include "xla/pjrt/se/tracked_device_buffer.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/event.h"
 #include "xla/stream_executor/stream.h"
+#include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/concurrency/async_value.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/concurrency/ref_count.h"
@@ -68,6 +74,139 @@ GetOrCreateAllocationReadyEvent(const xla::RawSEDeviceMemory& device_buffer,
 }  // namespace
 
 namespace xla {
+
+namespace {
+
+// Maximum number of chunks of a single chunked staged transfer in flight.
+constexpr int64_t kMaxStagingChunksInFlight = 4;
+
+// A pinned host staging buffer for one chunk, and an event recorded after the
+// most recent DMA that used it.
+struct StagingSlot {
+  std::shared_ptr<void> buffer;
+  std::unique_ptr<se::Event> dma_done;
+};
+
+// Allocates the staging slots for a chunked transfer of `transfer_size` bytes.
+absl::StatusOr<std::vector<StagingSlot>> AllocateStagingSlots(
+    PjRtStreamExecutorRawClient* client, LocalDeviceState* local_device,
+    se::Stream* stream, int64_t transfer_size, int64_t chunk_size) {
+  HostMemoryAllocator::AllocateOptions alloc_opts;
+  alloc_opts.numa_node = stream->parent()->numa_node();
+  alloc_opts.local_device_id = local_device->local_device_id();
+  std::vector<StagingSlot> slots(std::min(
+      kMaxStagingChunksInFlight, CeilOfRatio(transfer_size, chunk_size)));
+  for (StagingSlot& slot : slots) {
+    slot.buffer =
+        client->GetHostMemoryAllocator()->Allocate(chunk_size, alloc_opts);
+    if (slot.buffer == nullptr) {
+      return ResourceExhausted(
+          "Failed to allocate a %d-byte pinned host staging chunk for a "
+          "chunked host<->device transfer. The pinned host pool may be "
+          "exhausted or fragmented (see XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB and "
+          "XLA_PJRT_GPU_CC_STAGING_CHUNK_MB).",
+          chunk_size);
+    }
+    ABSL_ASSIGN_OR_RETURN(slot.dma_done, stream->parent()->CreateEvent());
+  }
+  return slots;
+}
+
+// Threading: the chunked helpers below run inside `run_transfer` on the
+// client's `async_work_runner()` and block that thread on `se::Event`s while
+// chunk DMAs complete. This is safe because (1) chunking is only enabled for
+// GPU Confidential Computing (or forced in tests), and the SE GPU client always
+// uses the default `MakeUnboundedAsyncWorkRunner`, which starts a new thread
+// when none are idle, so a blocked transfer cannot starve other work; and (2)
+// every awaited event is recorded after already-enqueued stream work, so it
+// completes on GPU progress alone and never waits on work from this runner.
+// Clients that supply a bounded runner would hold one thread per in-flight
+// chunked transfer.
+
+// Copies `transfer_size` bytes from host `src` to device `dst` in
+// `chunk_size`-byte chunks staged through `slots`. Host copies into the
+// staging slots run on the calling thread and overlap with the DMAs of
+// previously enqueued chunks. Blocks the calling thread until each slot's
+// previous DMA completed before reusing it.
+absl::Status ChunkedStagedHostToDevice(se::Stream* stream, const void* src,
+                                       se::DeviceAddressBase dst,
+                                       int64_t transfer_size,
+                                       int64_t chunk_size,
+                                       absl::Span<StagingSlot> slots) {
+  ABSL_ASSIGN_OR_RETURN(auto chunks,
+                        PlanStagingChunks(transfer_size, chunk_size));
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    auto [offset, size] = chunks[i];
+    StagingSlot& slot = slots[i % slots.size()];
+    if (i >= slots.size()) {
+      ABSL_RETURN_IF_ERROR(slot.dma_done->Synchronize());
+    }
+    {
+      tsl::profiler::TraceMe trace("H2D Copy To Staging Chunk");
+      std::memcpy(slot.buffer.get(), static_cast<const char*>(src) + offset,
+                  size);
+    }
+    se::DeviceAddressBase dst_chunk = dst.GetByteSlice(offset, size);
+    ABSL_RETURN_IF_ERROR(stream->Memcpy(&dst_chunk, slot.buffer.get(), size));
+    ABSL_RETURN_IF_ERROR(stream->RecordEvent(slot.dma_done.get()));
+  }
+  return absl::OkStatus();
+}
+
+// Copies `transfer_size` bytes from device `src` to host `dst` in
+// `chunk_size`-byte chunks staged through `slots`. Keeps up to `slots.size()`
+// chunk DMAs in flight while the calling thread copies completed chunks out of
+// the staging slots. Returns once `dst` is fully written.
+absl::Status ChunkedStagedDeviceToHost(se::Stream* stream,
+                                       se::DeviceAddressBase src, void* dst,
+                                       int64_t transfer_size,
+                                       int64_t chunk_size,
+                                       absl::Span<StagingSlot> slots) {
+  ABSL_ASSIGN_OR_RETURN(auto chunks,
+                        PlanStagingChunks(transfer_size, chunk_size));
+  auto enqueue_dma = [&](size_t i) -> absl::Status {
+    auto [offset, size] = chunks[i];
+    StagingSlot& slot = slots[i % slots.size()];
+    ABSL_RETURN_IF_ERROR(stream->Memcpy(slot.buffer.get(),
+                                        src.GetByteSlice(offset, size), size));
+    return stream->RecordEvent(slot.dma_done.get());
+  };
+  for (size_t i = 0; i < std::min(slots.size(), chunks.size()); ++i) {
+    ABSL_RETURN_IF_ERROR(enqueue_dma(i));
+  }
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    auto [offset, size] = chunks[i];
+    StagingSlot& slot = slots[i % slots.size()];
+    ABSL_RETURN_IF_ERROR(slot.dma_done->Synchronize());
+    {
+      tsl::profiler::TraceMe trace("D2H Copy From Staging Chunk");
+      std::memcpy(static_cast<char*>(dst) + offset, slot.buffer.get(), size);
+    }
+    if (i + slots.size() < chunks.size()) {
+      ABSL_RETURN_IF_ERROR(enqueue_dma(i + slots.size()));
+    }
+  }
+  return absl::OkStatus();
+}
+
+// On failure, chunk DMAs may still be accessing the staging slots, so drain
+// `stream` before the slots can be released.
+absl::Status DrainStreamOnError(se::Stream* stream, absl::Status status) {
+  if (!status.ok()) {
+    stream->BlockHostUntilDone().IgnoreError();
+  }
+  return status;
+}
+
+// Pinned host staging memory that enqueued stream work may still access.
+struct StagingMemory {
+  std::shared_ptr<void> buffer;
+  std::vector<StagingSlot> slots;
+
+  bool empty() const { return buffer == nullptr && slots.empty(); }
+};
+
+}  // namespace
 
 PjRtStreamExecutorDeviceEventPromise::PjRtStreamExecutorDeviceEventPromise(
     PjRtStreamExecutorRawClient* client, LocalDeviceState* local_device,
@@ -132,7 +271,9 @@ PjRtStreamExecutorRawBuffer::CopyRawHostToDeviceAndReturnEvent(
     if (transfer_size < sub_buffer.size()) {
       sub_buffer = sub_buffer.GetByteSlice(offset, transfer_size);
     }
-    std::shared_ptr<void> staging_buffer;
+    auto staging = std::make_shared<StagingMemory>();
+    std::shared_ptr<void>& staging_buffer = staging->buffer;
+    std::vector<StagingSlot>& staging_slots = staging->slots;
     auto status = [&]() -> absl::Status {
       ABSL_RETURN_IF_ERROR(client->WaitForAllocation(stream, *buf));
       if (transfer_size > 0) {
@@ -141,6 +282,16 @@ PjRtStreamExecutorRawBuffer::CopyRawHostToDeviceAndReturnEvent(
             return absl::InvalidArgumentError(
                 "host_memory_allocator should be initialized for "
                 "staging buffer transfer.");
+          }
+          if (client->ShouldChunkStagedTransfer(transfer_size)) {
+            const int64_t chunk_size = client->staging_chunk_size();
+            ABSL_ASSIGN_OR_RETURN(
+                staging_slots,
+                AllocateStagingSlots(client, local_device, stream,
+                                     transfer_size, chunk_size));
+            return ChunkedStagedHostToDevice(stream, src, sub_buffer,
+                                             transfer_size, chunk_size,
+                                             absl::MakeSpan(staging_slots));
           }
           HostMemoryAllocator::AllocateOptions alloc_opts;
           alloc_opts.numa_node = stream->parent()->numa_node();
@@ -175,11 +326,15 @@ PjRtStreamExecutorRawBuffer::CopyRawHostToDeviceAndReturnEvent(
       status = client->AllocateAndRecordEvent(
           device_event, local_device, stream,
           "PjRtStreamExecutorRawBuffer::CopyRawHostToDevice",
-          [staging_buffer = std::move(staging_buffer)]() mutable {
-            staging_buffer.reset();
-          });
+          [staging]() mutable { staging.reset(); });
     }
     if (!status.ok()) {
+      // Staged DMAs (and the host callback filling `staging_buffer`) may still
+      // be in flight, and AllocateAndRecordEvent drops the cleanup callback
+      // without running it on failure, so drain before releasing `staging`.
+      if (!staging->empty()) {
+        stream->BlockHostUntilDone().IgnoreError();
+      }
       client->SetEventAsError(device_event, status);
     }
   };
@@ -226,6 +381,19 @@ PjRtStreamExecutorRawBuffer::CopyRawDeviceToHostAndReturnEvent(
                 "host_memory_allocator should be initialized for "
                 "staging buffer transfer.");
           }
+          if (client->ShouldChunkStagedTransfer(transfer_size)) {
+            // All chunk DMAs and host copies complete before this returns, so
+            // the staging slots can be released when it goes out of scope.
+            const int64_t chunk_size = client->staging_chunk_size();
+            ABSL_ASSIGN_OR_RETURN(
+                std::vector<StagingSlot> staging_slots,
+                AllocateStagingSlots(client, local_device, stream,
+                                     transfer_size, chunk_size));
+            return DrainStreamOnError(
+                stream, ChunkedStagedDeviceToHost(
+                            stream, sub_buffer, dst, transfer_size, chunk_size,
+                            absl::MakeSpan(staging_slots)));
+          }
           HostMemoryAllocator::AllocateOptions alloc_opts;
           alloc_opts.numa_node = stream->parent()->numa_node();
           alloc_opts.local_device_id = local_device->local_device_id();
@@ -248,7 +416,6 @@ PjRtStreamExecutorRawBuffer::CopyRawDeviceToHostAndReturnEvent(
             tsl::profiler::TraceMe trace("D2H Copy From Staging Buffer");
             std::memcpy(dst, staging_buffer.get(), transfer_size);
           };
-          // TODO(parkers): This failing maybe consitutes a race.
           ABSL_RETURN_IF_ERROR(
               stream->DoHostCallback(copy_from_staging_buffer));
         } else {
@@ -266,6 +433,12 @@ PjRtStreamExecutorRawBuffer::CopyRawDeviceToHostAndReturnEvent(
           });
     }
     if (!status.ok()) {
+      // If enqueueing the host callback failed, the DMA into `staging_buffer`
+      // may still be in flight, so drain before releasing it. (Once the host
+      // callback is enqueued it owns a reference that outlives the DMA.)
+      if (staging_buffer != nullptr) {
+        stream->BlockHostUntilDone().IgnoreError();
+      }
       client->SetEventAsError(device_event, status);
     }
   };
